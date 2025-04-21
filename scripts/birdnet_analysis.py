@@ -10,16 +10,26 @@ import uuid
 import json
 import socket
 import functools
+import tempfile
 from queue import Queue, Empty
 from subprocess import CalledProcessError
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from logging.handlers import RotatingFileHandler
+from threading import Lock, RLock, Event
+import hashlib
+import shutil
 
 try:
     import psutil
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False  # Optional dependency for enhanced monitoring
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False  # Optional dependency for metrics
 
 import inotify.adapters
 from inotify.constants import IN_CLOSE_WRITE
@@ -31,9 +41,16 @@ from utils.reporting import extract_detection, summary, write_to_file, write_to_
 
 # Global variables
 shutdown = False
+shutdown_event = Event()  # Thread-safe event for signaling shutdown
 force_timer = None  # Timer for forced shutdown
 log = logging.getLogger(__name__)
-SCRIPT_VERSION = "1.2.1"  # Version tracking for logging
+SCRIPT_VERSION = "1.3.0"  # Updated version with production enhancements
+
+# Thread synchronization
+global_stats_lock = RLock()  # Reentrant lock for global stats access
+processed_files_lock = Lock()  # Lock for processed_files set access
+health_file_lock = Lock()  # Lock for health file updates
+recovery_file_lock = Lock()  # Lock for recovery file updates
 
 # Statistics tracking
 global_stats = {
@@ -42,8 +59,42 @@ global_stats = {
     "skipped_count": 0,
     "start_time": 0,
     "backlog_size": 0,
-    "circuit_breakers": {}
+    "circuit_breakers": {},
+    "memory_usage": [],
+    "corrupt_files_detected": 0,
+    "timeouts": 0,
+    "slow_analyses": 0,
+    "file_size_distribution": {
+        "0-1MB": 0,
+        "1-10MB": 0,
+        "10-50MB": 0,
+        "50-100MB": 0,
+        "100MB+": 0
+    }
 }
+
+# Connection pool for database operations
+db_connection_pool = None
+
+# Prometheus metrics (if available)
+if HAS_PROMETHEUS:
+    # Counters
+    PROCESSED_FILES = Counter('birdnet_processed_files_total', 'Total number of files processed')
+    ERROR_COUNT = Counter('birdnet_errors_total', 'Total number of errors encountered')
+    SKIPPED_FILES = Counter('birdnet_skipped_files_total', 'Total number of files skipped')
+    CORRUPT_FILES = Counter('birdnet_corrupt_files_total', 'Total number of corrupt files detected')
+    TIMEOUT_COUNT = Counter('birdnet_timeouts_total', 'Total number of analysis timeouts')
+    
+    # Gauges
+    QUEUE_SIZE = Gauge('birdnet_queue_size', 'Current size of the reporting queue')
+    BACKLOG_SIZE = Gauge('birdnet_backlog_size', 'Current size of the file backlog')
+    PROCESSED_FILES_SET_SIZE = Gauge('birdnet_processed_files_set_size', 'Size of the processed files tracking set')
+    MEMORY_USAGE = Gauge('birdnet_memory_usage_percent', 'Current memory usage percentage')
+    CPU_USAGE = Gauge('birdnet_cpu_usage_percent', 'Current CPU usage percentage')
+    
+    # Histograms
+    FILE_SIZE = Histogram('birdnet_file_size_bytes', 'Size of processed files in bytes', buckets=(1024*1024, 10*1024*1024, 50*1024*1024, 100*1024*1024, float('inf')))
+    ANALYSIS_DURATION = Histogram('birdnet_analysis_duration_seconds', 'Duration of analysis operations', buckets=(0.5, 1, 2, 5, 10, 30, 60, 120))
 
 
 class CircuitBreaker:
@@ -65,6 +116,7 @@ class CircuitBreaker:
         self.open = False
         self.total_failures = 0
         self.total_successes = 0
+        self.lock = Lock()  # Add thread safety
     
     def can_execute(self):
         """Check if the protected operation can be executed
@@ -72,50 +124,54 @@ class CircuitBreaker:
         Returns:
             bool: True if circuit is closed or can be reset, False otherwise
         """
-        if not self.open:
-            return True
-        
-        # Check if circuit should be reset
-        if time.time() - self.last_failure > self.reset_timeout:
-            log.info(f"Circuit breaker for {self.name} reset after timeout")
-            self.open = False
-            self.failures = 0
-            return True
-        return False
+        with self.lock:
+            if not self.open:
+                return True
+            
+            # Check if circuit should be reset
+            if time.time() - self.last_failure > self.reset_timeout:
+                log.info(f"Circuit breaker for {self.name} reset after timeout")
+                self.open = False
+                self.failures = 0
+                return True
+            return False
     
     def record_failure(self):
         """Record a failure and potentially open the circuit"""
-        self.failures += 1
-        self.total_failures += 1
-        self.last_failure = time.time()
-        if self.failures >= self.failure_threshold and not self.open:
-            log.warning(f"Circuit breaker for {self.name} opened after {self.failures} failures")
-            self.open = True
-            
+        with self.lock:
+            self.failures += 1
+            self.total_failures += 1
+            self.last_failure = time.time()
+            if self.failures >= self.failure_threshold and not self.open:
+                log.warning(f"Circuit breaker for {self.name} opened after {self.failures} failures")
+                self.open = True
+                
     def record_success(self):
         """Record a success and potentially close the circuit"""
-        self.total_successes += 1
-        if self.open:
-            self.open = False
-            self.failures = 0
-            log.info(f"Circuit breaker for {self.name} closed after success")
-        elif self.failures > 0:
-            self.failures = 0
-            
+        with self.lock:
+            self.total_successes += 1
+            if self.open:
+                self.open = False
+                self.failures = 0
+                log.info(f"Circuit breaker for {self.name} closed after success")
+            elif self.failures > 0:
+                self.failures = 0
+                
     def get_stats(self):
         """Get statistics about the circuit breaker
         
         Returns:
             dict: Statistics about successes and failures
         """
-        return {
-            "name": self.name,
-            "open": self.open,
-            "failures": self.failures,
-            "total_failures": self.total_failures,
-            "total_successes": self.total_successes,
-            "success_rate": self._calculate_success_rate()
-        }
+        with self.lock:
+            return {
+                "name": self.name,
+                "open": self.open,
+                "failures": self.failures,
+                "total_failures": self.total_failures,
+                "total_successes": self.total_successes,
+                "success_rate": self._calculate_success_rate()
+            }
     
     def _calculate_success_rate(self):
         """Calculate success rate
@@ -127,6 +183,163 @@ class CircuitBreaker:
         if total == 0:
             return None
         return (self.total_successes / total) * 100
+
+
+class DBConnectionPool:
+    """Simple connection pool for database operations
+    
+    This provides a thread-safe way to manage and reuse database connections
+    """
+    def __init__(self, max_connections=10, connection_timeout=30):
+        self.max_connections = max_connections
+        self.connection_timeout = connection_timeout
+        self.pool = Queue(maxsize=max_connections)
+        self.active_connections = 0
+        self.lock = Lock()
+        self.pool_initialized = False
+        
+    def initialize(self):
+        """Initialize the connection pool (lazy initialization)"""
+        if self.pool_initialized:
+            return
+        with self.lock:
+            if not self.pool_initialized:
+                # Create initial connections
+                for _ in range(min(3, self.max_connections)):
+                    try:
+                        connection = self._create_connection()
+                        self.pool.put(connection)
+                    except Exception as e:
+                        log.warning(f"Failed to create initial DB connection: {e}")
+                self.pool_initialized = True
+                log.info(f"Database connection pool initialized with {self.pool.qsize()} connections")
+                
+    def get_connection(self):
+        """Get a connection from the pool or create a new one
+        
+        Returns:
+            connection: Database connection object
+        """
+        # Ensure pool is initialized
+        if not self.pool_initialized:
+            self.initialize()
+            
+        # Try to get a connection from the pool
+        try:
+            connection = self.pool.get(block=True, timeout=self.connection_timeout)
+            # Validate connection before returning
+            if not self._validate_connection(connection):
+                connection = self._create_connection()
+            return connection
+        except Empty:
+            # If pool is empty, create new connection if under limit
+            with self.lock:
+                if self.active_connections < self.max_connections:
+                    self.active_connections += 1
+                    return self._create_connection()
+                else:
+                    raise Exception("Maximum database connections reached")
+    
+    def release_connection(self, connection):
+        """Return a connection to the pool
+        
+        Args:
+            connection: Database connection to return to the pool
+        """
+        if connection is None:
+            return
+            
+        # Validate connection health before returning to pool
+        if self._validate_connection(connection):
+            self.pool.put(connection)
+        else:
+            # If connection is not valid, close and create a new one
+            self._close_connection(connection)
+            try:
+                new_connection = self._create_connection()
+                self.pool.put(new_connection)
+            except Exception as e:
+                with self.lock:
+                    self.active_connections -= 1
+                log.warning(f"Failed to create replacement connection: {e}")
+    
+    def close_all(self):
+        """Close all connections in the pool"""
+        # Clear the pool
+        with self.lock:
+            while not self.pool.empty():
+                try:
+                    connection = self.pool.get(block=False)
+                    self._close_connection(connection)
+                except Empty:
+                    break
+            self.active_connections = 0
+            self.pool_initialized = False
+        log.info("All database connections closed")
+            
+    def _create_connection(self):
+        """Create a new database connection
+        
+        This method must be implemented by the specific database adapter
+        
+        Returns:
+            connection: New database connection
+        """
+        # Placeholder for actual implementation (replace with your DB connection code)
+        # Example for SQLite
+        try:
+            import sqlite3
+            # Get DB path from settings
+            conf = get_settings()
+            db_path = conf.get('DB_PATH', '/var/lib/birdnet/birds.db')
+            connection = sqlite3.connect(db_path, timeout=30)
+            
+            # Test connection
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            
+            return connection
+        except ImportError:
+            log.warning("SQLite3 not available, using dummy connection")
+            # Dummy connection for testing
+            class DummyConnection:
+                def close(self):
+                    pass
+            return DummyConnection()
+            
+    def _validate_connection(self, connection):
+        """Validate that a connection is still active and usable
+        
+        Args:
+            connection: Database connection to validate
+            
+        Returns:
+            bool: True if connection is valid, False otherwise
+        """
+        # Placeholder for actual implementation
+        # For example, with SQLite:
+        try:
+            if hasattr(connection, 'cursor'):
+                cursor = connection.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return True
+            return True  # Default to true for dummy connections
+        except Exception:
+            return False
+            
+    def _close_connection(self, connection):
+        """Close a database connection
+        
+        Args:
+            connection: Database connection to close
+        """
+        try:
+            if hasattr(connection, 'close'):
+                connection.close()
+        except Exception as e:
+            log.warning(f"Error closing database connection: {e}")
 
 
 def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,), logger=None):
@@ -180,9 +393,10 @@ def sig_handler(sig_num, curr_stack_frame):
         sig_num: Signal number
         curr_stack_frame: Current stack frame
     """
-    global shutdown, force_timer
+    global shutdown, force_timer, shutdown_event
     log.info(f'Caught shutdown signal {sig_num}, initiating graceful shutdown')
     shutdown = True
+    shutdown_event.set()  # Signal all waiting threads
     
     # Cancel existing timer if there is one
     if force_timer and force_timer.is_alive():
@@ -231,6 +445,30 @@ def validate_configuration(conf):
             except Exception as e:
                 raise ValueError(f"Could not create directory {directory}: {e}")
     
+    # Validate write permissions for critical directories
+    dirs_to_validate_write = dirs_to_check + [
+        conf.get('RECOVERY_DIR', '/tmp/birdnet_recovery'),
+        os.path.dirname(conf.get('HEALTH_CHECK_FILE', '/tmp/birdnet_health')),
+        os.path.dirname(conf.get('RECOVERY_FILE', '/tmp/birdnet_recovery.json'))
+    ]
+    
+    for directory in dirs_to_validate_write:
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as e:
+                log.warning(f"Could not create directory {directory}: {e}")
+                
+        if directory and os.path.exists(directory):
+            # Check write permissions by trying to create a test file
+            test_file = os.path.join(directory, f".write_test_{uuid.uuid4().hex}")
+            try:
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+            except (IOError, OSError) as e:
+                raise ValueError(f"No write permission for directory {directory}: {e}")
+    
     # Set defaults for new configurations to ensure backward compatibility
     defaults = {
         'RECORDING_LENGTH': 30,
@@ -265,6 +503,16 @@ def validate_configuration(conf):
         'PROCESSED_FILES_MEMORY_LIMIT': 10000,  # Maximum number of processed files to keep in memory
         'FILE_SIZE_WARNING_THRESHOLD_MB': 100,  # Warn for files larger than this in MB
         'PATH_VALIDATION_STRICT': 'true',  # Enable strict path validation
+        'DB_MAX_CONNECTIONS': 10,  # Maximum database connections in pool
+        'DB_CONNECTION_TIMEOUT': 30,  # Timeout for database connection operations
+        'ANALYSIS_TIMEOUT': 300,  # Timeout for analysis operations in seconds
+        'ENABLE_METRICS': 'false',  # Enable Prometheus metrics
+        'METRICS_PORT': 9090,  # Port for Prometheus metrics server
+        'MAX_FILE_AGE_DAYS': 30,  # Maximum age of files to process
+        'CORRUPT_FILE_DIR': '',  # Directory to move corrupt files to (empty = delete)
+        'STATS_RETENTION_COUNT': 100,  # Number of memory/CPU readings to retain
+        'CPU_WARNING_THRESHOLD': 80,  # CPU usage warning threshold percentage
+        'DISK_WARNING_THRESHOLD': 90,  # Disk usage warning threshold percentage
     }
     
     # Apply defaults
@@ -277,7 +525,7 @@ def validate_configuration(conf):
     for key, value in conf.items():
         if key in defaults and not isinstance(value, type(defaults[key])):
             try:
-                if isinstance(defaults[key], bool) or key.endswith('_STRICT') or key.startswith('LEGACY_'):
+                if isinstance(defaults[key], bool) or key.endswith('_STRICT') or key.startswith('LEGACY_') or key.startswith('ENABLE_'):
                     conf_with_types[key] = str(value).lower() == 'true'
                 elif isinstance(defaults[key], int):
                     conf_with_types[key] = int(value)
@@ -339,10 +587,12 @@ def is_system_overloaded(conf):
     Returns:
         bool: True if system is overloaded, False otherwise
     """
-    # Memory threshold
+    # Thresholds
     max_memory_percent = conf.get('MAX_MEMORY_PERCENT', 85)
+    cpu_warning_threshold = conf.get('CPU_WARNING_THRESHOLD', 80)
+    disk_warning_threshold = conf.get('DISK_WARNING_THRESHOLD', 90)
     
-    # Simple load check - could be more sophisticated
+    # Check load
     try:
         if HAS_PSUTIL:
             # Use psutil if available for better resource monitoring
@@ -350,33 +600,94 @@ def is_system_overloaded(conf):
             memory_percent = psutil.virtual_memory().percent
             disk_percent = psutil.disk_usage('/').percent
             
-            # Add memory info to global stats
-            if 'memory_usage' not in global_stats:
-                global_stats['memory_usage'] = []
+            # Update metrics if enabled
+            if HAS_PROMETHEUS:
+                MEMORY_USAGE.set(memory_percent)
+                CPU_USAGE.set(cpu_percent)
             
-            # Keep last 10 memory readings
-            memory_data = {
-                'timestamp': time.time(),
-                'memory_percent': memory_percent,
-                'cpu_percent': cpu_percent,
-                'disk_percent': disk_percent
-            }
-            global_stats['memory_usage'].append(memory_data)
-            if len(global_stats['memory_usage']) > 10:
-                global_stats['memory_usage'] = global_stats['memory_usage'][-10:]
+            # Add memory info to global stats with thread safety
+            with global_stats_lock:
+                if 'memory_usage' not in global_stats:
+                    global_stats['memory_usage'] = []
+                
+                # Keep last readings based on configured retention
+                memory_data = {
+                    'timestamp': time.time(),
+                    'memory_percent': memory_percent,
+                    'cpu_percent': cpu_percent,
+                    'disk_percent': disk_percent
+                }
+                
+                global_stats['memory_usage'].append(memory_data)
+                retention = conf.get('STATS_RETENTION_COUNT', 100)
+                if len(global_stats['memory_usage']) > retention:
+                    global_stats['memory_usage'] = global_stats['memory_usage'][-retention:]
+            
+            # Log warnings if resources are high but not critical
+            if memory_percent > max_memory_percent * 0.9 and memory_percent <= max_memory_percent:
+                log.warning(f"Memory usage approaching threshold: {memory_percent:.1f}%")
+            if cpu_percent > cpu_warning_threshold * 0.9 and cpu_percent <= cpu_warning_threshold:
+                log.warning(f"CPU usage approaching threshold: {cpu_percent:.1f}%")
+            if disk_percent > disk_warning_threshold * 0.9 and disk_percent <= disk_warning_threshold:
+                log.warning(f"Disk usage approaching threshold: {disk_percent:.1f}%")
             
             # Return True if any resource is critically high
-            return (cpu_percent > 80 or 
-                   memory_percent > max_memory_percent or 
-                   disk_percent > 95)
+            is_overloaded = (cpu_percent > cpu_warning_threshold or 
+                            memory_percent > max_memory_percent or 
+                            disk_percent > disk_warning_threshold)
+            
+            if is_overloaded:
+                log.warning(f"System overloaded: CPU={cpu_percent:.1f}%, Memory={memory_percent:.1f}%, Disk={disk_percent:.1f}%")
+                
+            return is_overloaded
         else:
             # Fallback to basic load average check
             load = os.getloadavg()[0]
             cpu_count = os.cpu_count() or 1
-            return load > (cpu_count * 0.8)  # 80% of available CPUs
+            is_overloaded = load > (cpu_count * 0.8)  # 80% of available CPUs
+            
+            if is_overloaded:
+                log.warning(f"System load high: {load:.1f} (threshold: {cpu_count * 0.8:.1f})")
+                
+            return is_overloaded
     except Exception as e:
         log.warning(f"Error checking system load: {e}")
         return False
+
+
+def atomic_write_json(data, filepath):
+    """Write JSON data to a file atomically
+    
+    Creates a temporary file and renames it to ensure atomic write operations
+    
+    Args:
+        data: Data to write to file (must be JSON serializable)
+        filepath: Target file path
+    """
+    # Ensure directory exists
+    directory = os.path.dirname(filepath)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+    
+    # Create a temporary file in the same directory
+    temp_filepath = f"{filepath}.{uuid.uuid4().hex}.tmp"
+    
+    try:
+        with open(temp_filepath, 'w') as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())  # Ensure data is written to disk
+            
+        # Perform atomic rename
+        os.replace(temp_filepath, filepath)
+    except Exception as e:
+        # Clean up temp file if it exists
+        if os.path.exists(temp_filepath):
+            try:
+                os.remove(temp_filepath)
+            except Exception:
+                pass
+        raise e
 
 
 def save_processing_state(processed_files, queue_items, recovery_file):
@@ -391,24 +702,32 @@ def save_processing_state(processed_files, queue_items, recovery_file):
         # Create directory if needed
         os.makedirs(os.path.dirname(recovery_file), exist_ok=True)
         
-        # Convert processed_files set to list and trim to reasonable size
-        processed_list = list(processed_files)
-        if len(processed_list) > 1000:
-            processed_list = processed_list[-1000:]
+        # Convert processed_files set to list and trim to reasonable size with thread safety
+        with processed_files_lock:
+            processed_list = list(processed_files)
+            if len(processed_list) > 1000:
+                processed_list = processed_list[-1000:]
         
-        with open(recovery_file, 'w') as f:
-            json.dump({
+        # Gather stats with thread safety
+        with global_stats_lock:
+            stats_copy = {
+                'processed_count': global_stats.get('processed_count', 0),
+                'error_count': global_stats.get('error_count', 0),
+                'skipped_count': global_stats.get('skipped_count', 0),
+                'corrupt_files_detected': global_stats.get('corrupt_files_detected', 0),
+                'timeouts': global_stats.get('timeouts', 0),
+                'uptime': int(time.time() - global_stats.get('start_time', time.time()))
+            }
+        
+        # Use thread-safe atomic write
+        with recovery_file_lock:
+            atomic_write_json({
                 'timestamp': time.time(),
                 'version': SCRIPT_VERSION,
                 'processed_files': processed_list,
                 'queue_items': queue_items,
-                'stats': {
-                    'processed_count': global_stats.get('processed_count', 0),
-                    'error_count': global_stats.get('error_count', 0),
-                    'skipped_count': global_stats.get('skipped_count', 0),
-                    'uptime': int(time.time() - global_stats.get('start_time', time.time()))
-                }
-            }, f)
+                'stats': stats_copy
+            }, recovery_file)
     except Exception as e:
         log.warning(f"Failed to save recovery state: {e}")
 
@@ -433,10 +752,11 @@ def load_processing_state(recovery_file):
                 log.warning(f"Recovery state version mismatch: {state_version} != {SCRIPT_VERSION}")
                 # Still try to use the data, just log the warning
                 
-            # Load stats
+            # Load stats with thread safety
             if 'stats' in state:
-                for key, value in state['stats'].items():
-                    global_stats[key] = value
+                with global_stats_lock:
+                    for key, value in state['stats'].items():
+                        global_stats[key] = value
                 
             log.info(f"Loaded recovery state from {recovery_file}")
             return set(state.get('processed_files', [])), state.get('queue_items', [])
@@ -491,21 +811,28 @@ def log_error_with_context(e, context=None):
     # Log the error with all information
     log.error(f"Error[{error_id}] {e.__class__.__name__}: {str(e)} | {context_str}\n{tb}")
     
+    # Update error counter with thread safety
+    with global_stats_lock:
+        global_stats['error_count'] = global_stats.get('error_count', 0) + 1
+    
+    # Update metrics if available
+    if HAS_PROMETHEUS:
+        ERROR_COUNT.inc()
+    
     # Save error details to file for later analysis
     try:
         error_log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs', 'errors')
         os.makedirs(error_log_dir, exist_ok=True)
         
         error_file = os.path.join(error_log_dir, f"error_{error_id}_{int(time.time())}.json")
-        with open(error_file, 'w') as f:
-            json.dump({
-                'error': {
-                    'type': e.__class__.__name__,
-                    'message': str(e),
-                    'traceback': tb
-                },
-                'context': system_info
-            }, f, indent=2)
+        atomic_write_json({
+            'error': {
+                'type': e.__class__.__name__,
+                'message': str(e),
+                'traceback': tb
+            },
+            'context': system_info
+        }, error_file)
     except Exception as log_err:
         log.warning(f"Could not save detailed error log: {log_err}")
     
@@ -521,73 +848,300 @@ def update_health_file(health_file, status, extra_info=None):
         extra_info (dict, optional): Additional information to include
     """
     try:
-        health_dir = os.path.dirname(health_file)
-        # First check if directory exists before trying to create it
-        if not os.path.exists(health_dir):
-            try:
-                os.makedirs(health_dir, exist_ok=True)
-            except Exception as e:
-                log.warning(f"Could not create health directory {health_dir}: {e}")
-                # Try using /tmp as fallback
-                health_file = f"/tmp/birdnet_health_{os.getpid()}"
-        
-        health_data = {
-            "timestamp": time.time(),
-            "status": status,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "version": SCRIPT_VERSION,
-            "uptime": int(time.time() - global_stats.get('start_time', time.time()))
-        }
-        
-        # Add system stats if psutil is available
-        if HAS_PSUTIL:
-            try:
-                health_data.update({
-                    "cpu_percent": psutil.cpu_percent(interval=0.1),
-                    "memory_percent": psutil.virtual_memory().percent,
-                    "disk_percent": psutil.disk_usage('/').percent
-                })
-            except Exception as e:
-                health_data["stat_error"] = str(e)
-        
-        # Add stats from global stats
-        for key in ["processed_count", "error_count", "skipped_count"]:
-            if key in global_stats:
-                health_data[key] = global_stats[key]
-        
-        # Add circuit breaker stats
-        if 'circuit_breakers' in global_stats:
-            health_data["circuit_breakers"] = global_stats['circuit_breakers']
-        
-        # Add extra info
-        if extra_info:
-            health_data.update(extra_info)
+        with health_file_lock:  # Thread safety for health file updates
+            health_dir = os.path.dirname(health_file)
+            # First check if directory exists before trying to create it
+            if not os.path.exists(health_dir):
+                try:
+                    os.makedirs(health_dir, exist_ok=True)
+                except Exception as e:
+                    log.warning(f"Could not create health directory {health_dir}: {e}")
+                    # Try using /tmp as fallback
+                    health_file = f"/tmp/birdnet_health_{os.getpid()}"
             
-        # Handle atomicity by writing to temporary file first
-        tmp_health_file = f"{health_file}.tmp"
-        with open(tmp_health_file, 'w') as f:
-            json.dump(health_data, f)
-        
-        # Atomic replace
-        os.replace(tmp_health_file, health_file)
+            # Gather current stats with thread safety
+            with global_stats_lock:
+                stats_copy = {
+                    "processed_count": global_stats.get("processed_count", 0),
+                    "error_count": global_stats.get("error_count", 0),
+                    "skipped_count": global_stats.get("skipped_count", 0),
+                    "corrupt_files_detected": global_stats.get("corrupt_files_detected", 0),
+                    "timeouts": global_stats.get("timeouts", 0),
+                    "slow_analyses": global_stats.get("slow_analyses", 0)
+                }
+            
+            health_data = {
+                "timestamp": time.time(),
+                "status": status,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "version": SCRIPT_VERSION,
+                "uptime": int(time.time() - global_stats.get('start_time', time.time()))
+            }
+            
+            # Add system stats if psutil is available
+            if HAS_PSUTIL:
+                try:
+                    memory_percent = psutil.virtual_memory().percent
+                    cpu_percent = psutil.cpu_percent(interval=0.1)
+                    disk_percent = psutil.disk_usage('/').percent
+                    
+                    health_data.update({
+                        "cpu_percent": cpu_percent,
+                        "memory_percent": memory_percent,
+                        "disk_percent": disk_percent
+                    })
+                    
+                    # Add warning flags
+                    health_data["memory_warning"] = memory_percent > 80
+                    health_data["cpu_warning"] = cpu_percent > 80
+                    health_data["disk_warning"] = disk_percent > 90
+                    
+                except Exception as e:
+                    health_data["stat_error"] = str(e)
+            
+            # Add stats from global stats
+            health_data.update(stats_copy)
+            
+            # Add circuit breaker stats
+            if 'circuit_breakers' in global_stats:
+                health_data["circuit_breakers"] = global_stats['circuit_breakers']
+            
+            # Add extra info
+            if extra_info:
+                health_data.update(extra_info)
+                
+            # Use atomic write to prevent partial reads
+            atomic_write_json(health_data, health_file)
             
     except Exception as e:
         log.warning(f"Failed to update health check: {e}")
 
 
+def validate_wav_file(file_path, min_size_bytes=1024, conf=None):
+    """Validate if a WAV file is not corrupt and has proper format
+    
+    Args:
+        file_path (str): Path to WAV file
+        min_size_bytes (int): Minimum acceptable file size
+        conf (dict, optional): Configuration settings
+        
+    Returns:
+        bool: True if file is valid, False otherwise
+    """
+    # Default configuration
+    if conf is None:
+        conf = {}
+    
+    corrupt_file_dir = conf.get('CORRUPT_FILE_DIR', '')
+    
+    try:
+        # Basic file system checks
+        if not os.path.exists(file_path):
+            log.warning(f"File does not exist: {file_path}")
+            return False
+            
+        # Check file size - reject empty or suspiciously small files
+        file_size = os.path.getsize(file_path)
+        if file_size < min_size_bytes:
+            log.warning(f"File too small to be a valid WAV: {file_path} ({file_size} bytes)")
+            
+            # Track corrupt files
+            with global_stats_lock:
+                global_stats['corrupt_files_detected'] = global_stats.get('corrupt_files_detected', 0) + 1
+            
+            # Update metrics if available
+            if HAS_PROMETHEUS:
+                CORRUPT_FILES.inc()
+            
+            # Move or delete corrupt file
+            handle_corrupt_file(file_path, corrupt_file_dir)
+            return False
+            
+        # Check file age if configured
+        max_age_days = conf.get('MAX_FILE_AGE_DAYS', 30)
+        if max_age_days > 0:
+            file_age_days = (time.time() - os.path.getmtime(file_path)) / (24 * 3600)
+            if file_age_days > max_age_days:
+                log.info(f"Skipping file older than {max_age_days} days: {file_path} ({file_age_days:.1f} days old)")
+                return False
+        
+        # Check WAV file header
+        with open(file_path, 'rb') as f:
+            header = f.read(44)  # Standard WAV header size
+            
+            # Check RIFF header
+            if len(header) < 12 or header[0:4] != b'RIFF' or header[8:12] != b'WAVE':
+                log.warning(f"Invalid WAV header in file: {file_path}")
+                
+                # Track corrupt files
+                with global_stats_lock:
+                    global_stats['corrupt_files_detected'] = global_stats.get('corrupt_files_detected', 0) + 1
+                
+                # Update metrics if available
+                if HAS_PROMETHEUS:
+                    CORRUPT_FILES.inc()
+                
+                # Move or delete corrupt file
+                handle_corrupt_file(file_path, corrupt_file_dir)
+                return False
+                
+            # Additional header validation could be added here
+        
+        # Update file size metrics
+        if HAS_PROMETHEUS:
+            FILE_SIZE.observe(file_size)
+            
+        # Track file size distribution
+        with global_stats_lock:
+            if file_size < 1024 * 1024:  # < 1MB
+                global_stats['file_size_distribution']['0-1MB'] += 1
+            elif file_size < 10 * 1024 * 1024:  # 1-10MB
+                global_stats['file_size_distribution']['1-10MB'] += 1
+            elif file_size < 50 * 1024 * 1024:  # 10-50MB
+                global_stats['file_size_distribution']['10-50MB'] += 1
+            elif file_size < 100 * 1024 * 1024:  # 50-100MB
+                global_stats['file_size_distribution']['50-100MB'] += 1
+            else:  # > 100MB
+                global_stats['file_size_distribution']['100MB+'] += 1
+        
+        return True
+        
+    except Exception as e:
+        log.warning(f"Error validating WAV file {file_path}: {e}")
+        return False
+
+
+def handle_corrupt_file(file_path, corrupt_file_dir):
+    """Handle corrupt file by moving or deleting it
+    
+    Args:
+        file_path (str): Path to corrupt file
+        corrupt_file_dir (str): Directory to move corrupt files to (empty = delete)
+    """
+    try:
+        if corrupt_file_dir and os.path.isdir(corrupt_file_dir):
+            # Move to corrupt file directory
+            filename = os.path.basename(file_path)
+            corrupt_path = os.path.join(corrupt_file_dir, f"corrupt_{int(time.time())}_{filename}")
+            shutil.move(file_path, corrupt_path)
+            log.info(f"Moved corrupt file to: {corrupt_path}")
+        else:
+            # Delete corrupt file
+            os.remove(file_path)
+            log.info(f"Deleted corrupt file: {file_path}")
+    except Exception as e:
+        log.warning(f"Failed to handle corrupt file {file_path}: {e}")
+
+
+def check_dependencies():
+    """Check and validate external dependencies and services
+    
+    Returns:
+        dict: Dictionary of dependency statuses
+    """
+    dependency_status = {
+        'model_loaded': False,
+        'database': False,
+        'apprise': False,
+        'weather': False,
+        'disk_writable': False,
+        'psutil': HAS_PSUTIL,
+        'prometheus': HAS_PROMETHEUS
+    }
+    
+    # Check if model is loaded
+    try:
+        # This is just a proxy check - your actual check might differ
+        # We're just verifying that the module is imported
+        import server
+        dependency_status['model_loaded'] = True
+    except Exception as e:
+        log.error(f"Model loading check failed: {e}")
+    
+    # Check database connection
+    try:
+        global db_connection_pool
+        if db_connection_pool is None:
+            conf = get_settings()
+            db_connection_pool = DBConnectionPool(
+                max_connections=conf.get('DB_MAX_CONNECTIONS', 10),
+                connection_timeout=conf.get('DB_CONNECTION_TIMEOUT', 30)
+            )
+            
+        # Test connection
+        conn = db_connection_pool.get_connection()
+        db_connection_pool.release_connection(conn)
+        dependency_status['database'] = True
+    except Exception as e:
+        log.error(f"Database connection check failed: {e}")
+    
+    # Check apprise configuration
+    try:
+        # This is a placeholder - modify according to your actual apprise setup
+        from utils.reporting import apprise
+        dependency_status['apprise'] = True
+    except Exception as e:
+        log.warning(f"Apprise configuration check failed: {e}")
+    
+    # Check weather API
+    try:
+        # This is a placeholder - modify according to your actual weather API setup
+        from utils.reporting import bird_weather
+        dependency_status['weather'] = True
+    except Exception as e:
+        log.warning(f"Weather API check failed: {e}")
+    
+    # Check disk write permissions for important directories
+    try:
+        conf = get_settings()
+        test_dirs = [
+            conf['RECS_DIR'],
+            conf.get('STREAM_DATA_DIR', os.path.join(conf['RECS_DIR'], 'StreamData')),
+            conf.get('RECOVERY_DIR', '/tmp/birdnet_recovery')
+        ]
+        
+        all_writable = True
+        for directory in test_dirs:
+            if not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+                
+            test_file = os.path.join(directory, f".write_test_{uuid.uuid4().hex}")
+            try:
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+            except Exception:
+                all_writable = False
+                break
+                
+        dependency_status['disk_writable'] = all_writable
+    except Exception as e:
+        log.error(f"Disk write permission check failed: {e}")
+    
+    return dependency_status
+
+
 def main():
     """Main processing function for BirdNet analysis"""
-    global_stats['start_time'] = time.time()
+    with global_stats_lock:
+        global_stats['start_time'] = time.time()
+    
     log.info(f"Starting BirdNet Analysis v{SCRIPT_VERSION}")
     
     try:
-        # Load model and validate configuration
-        log.info("Loading global model...")
-        load_global_model()
-        
+        # Validate configuration first
         conf = validate_configuration(get_settings())
         log.info(f"Configuration validated successfully")
+        
+        # Start metrics server if enabled
+        if conf.get('ENABLE_METRICS', False) and HAS_PROMETHEUS:
+            metrics_port = conf.get('METRICS_PORT', 9090)
+            try:
+                start_http_server(metrics_port)
+                log.info(f"Prometheus metrics server started on port {metrics_port}")
+            except Exception as e:
+                log.warning(f"Failed to start metrics server: {e}")
         
         # Check for legacy mode
         legacy_mode = conf.get('LEGACY_MODE', False)
@@ -600,8 +1154,42 @@ def main():
         health_interval = conf['HEALTH_INTERVAL']
         state_save_interval = conf['STATE_SAVE_INTERVAL']
         
+        # Initialize database connection pool
+        global db_connection_pool
+        db_connection_pool = DBConnectionPool(
+            max_connections=conf.get('DB_MAX_CONNECTIONS', 10),
+            connection_timeout=conf.get('DB_CONNECTION_TIMEOUT', 30)
+        )
+        
+        # Load model and check dependencies
+        log.info("Checking dependencies and loading global model...")
+        dependency_status = check_dependencies()
+        
+        # Fail fast if critical dependencies are not available
+        if not dependency_status['model_loaded']:
+            raise RuntimeError("Failed to load AI model - cannot continue")
+            
+        if not dependency_status['disk_writable']:
+            raise RuntimeError("Critical directories are not writable - cannot continue")
+        
+        # Load global model with retry for robustness
+        load_global_model_with_retry = retry(
+            max_attempts=3,
+            delay=2.0,
+            backoff=2.0,
+            exceptions=(Exception,)
+        )(load_global_model)
+        
+        try:
+            load_global_model_with_retry()
+        except Exception as e:
+            error_id = log_error_with_context(e, {"context": "model_loading"})
+            raise RuntimeError(f"Failed to load global model after retries (ID: {error_id}): {e}")
+        
         # Initialize health status
-        update_health_file(health_check_file, "starting")
+        update_health_file(health_check_file, "starting", {
+            "dependencies": dependency_status
+        })
         
         # Resource management settings
         max_queue_size = conf['MAX_QUEUE_SIZE']
@@ -631,21 +1219,29 @@ def main():
         log.info("Getting backlog of WAV files...")
         backlog = get_wav_files()
         
-        # Track processed files to avoid race conditions
+        # Track processed files to avoid race conditions (with thread safety)
         processed_files = set()
-        for file in backlog:
-            sanitized = sanitize_path(file, base_dir, strict=path_validation_strict)
-            if sanitized:
-                processed_files.add(sanitized)
+        with processed_files_lock:
+            for file in backlog:
+                sanitized = sanitize_path(file, base_dir, strict=path_validation_strict)
+                if sanitized:
+                    processed_files.add(sanitized)
+            
+            # Add recovered files to processed set
+            for file in processed_files_from_recovery:
+                sanitized = sanitize_path(file, base_dir, strict=path_validation_strict)
+                if sanitized:
+                    processed_files.add(sanitized)
         
-        # Add recovered files to processed set
-        for file in processed_files_from_recovery:
-            sanitized = sanitize_path(file, base_dir, strict=path_validation_strict)
-            if sanitized:
-                processed_files.add(sanitized)
-        
-        # Update global stats
-        global_stats['backlog_size'] = len(backlog)
+        # Update global stats with thread safety
+        with global_stats_lock:
+            global_stats['backlog_size'] = len(backlog)
+            
+        # Update metrics if enabled
+        if HAS_PROMETHEUS:
+            BACKLOG_SIZE.set(len(backlog))
+            with processed_files_lock:
+                PROCESSED_FILES_SET_SIZE.set(len(processed_files))
 
         # Initialize reporting queue with size limit
         report_queue = Queue(maxsize=max_queue_size)
@@ -691,10 +1287,25 @@ def main():
                     sanitized = sanitize_path(file_name, base_dir, strict=path_validation_strict)
                     if sanitized:
                         try:
-                            process_file(sanitized, report_queue, conf, base_dir)
-                            global_stats['processed_count'] += 1
+                            # Validate file before processing
+                            if validate_wav_file(sanitized, conf=conf):
+                                process_file(sanitized, report_queue, conf, base_dir)
+                                with global_stats_lock:
+                                    global_stats['processed_count'] += 1
+                                    
+                                # Update metrics if enabled
+                                if HAS_PROMETHEUS:
+                                    PROCESSED_FILES.inc()
+                            else:
+                                with global_stats_lock:
+                                    global_stats['skipped_count'] += 1
+                                    
+                                # Update metrics if enabled
+                                if HAS_PROMETHEUS:
+                                    SKIPPED_FILES.inc()
                         except Exception as e:
-                            global_stats['error_count'] += 1
+                            with global_stats_lock:
+                                global_stats['error_count'] += 1
                             error_id = log_error_with_context(e, {"context": "legacy_backlog", "file": file_name})
                             log.error(f"Error in legacy backlog processing (ID: {error_id}): {e}")
                     if shutdown:
@@ -718,16 +1329,27 @@ def main():
                         for file_name in chunk:
                             sanitized = sanitize_path(file_name, base_dir, strict=path_validation_strict)
                             if sanitized:
-                                futures.append(
-                                    executor.submit(process_file, sanitized, report_queue, conf, base_dir)
-                                )
+                                # Validate file before submitting to thread pool
+                                if validate_wav_file(sanitized, conf=conf):
+                                    futures.append(
+                                        executor.submit(process_file, sanitized, report_queue, conf, base_dir)
+                                    )
+                                else:
+                                    with global_stats_lock:
+                                        global_stats['skipped_count'] += 1
+                                    if HAS_PROMETHEUS:
+                                        SKIPPED_FILES.inc()
                         
                         for idx, future in enumerate(futures):
                             try:
                                 future.result()
-                                global_stats['processed_count'] += 1
+                                with global_stats_lock:
+                                    global_stats['processed_count'] += 1
+                                if HAS_PROMETHEUS:
+                                    PROCESSED_FILES.inc()
                             except Exception as e:
-                                global_stats['error_count'] += 1
+                                with global_stats_lock:
+                                    global_stats['error_count'] += 1
                                 error_id = log_error_with_context(e, {"context": "backlog_processing"})
                                 log.error(f"Error in backlog processing (ID: {error_id}): {e}")
                                 
@@ -743,6 +1365,10 @@ def main():
                                     "processed_files": global_stats['processed_count'],
                                     "error_count": global_stats['error_count']
                                 })
+                                
+                                # Update metrics if enabled
+                                if HAS_PROMETHEUS:
+                                    QUEUE_SIZE.set(report_queue.qsize())
                     
                     # Save state after each chunk
                     save_processing_state(processed_files, [], recovery_file)
@@ -770,6 +1396,15 @@ def main():
             # Periodically update health
             current_time = time.time()
             if 'last_health_update' not in global_stats or current_time - global_stats['last_health_update'] > health_interval:
+                with global_stats_lock:
+                    global_stats['last_health_update'] = current_time
+                    
+                # Update metrics if enabled
+                if HAS_PROMETHEUS:
+                    with processed_files_lock:
+                        PROCESSED_FILES_SET_SIZE.set(len(processed_files))
+                    QUEUE_SIZE.set(report_queue.qsize())
+                
                 update_health_file(health_check_file, "monitoring", {
                     "queue_size": report_queue.qsize(),
                     "processed_files": global_stats['processed_count'],
@@ -778,12 +1413,12 @@ def main():
                     "uptime_seconds": int(current_time - global_stats['start_time']),
                     "recent_file_count": len(processed_files)
                 })
-                global_stats['last_health_update'] = current_time
             
             # Periodically save state
             if 'last_state_save' not in global_stats or current_time - global_stats['last_state_save'] > state_save_interval:
+                with global_stats_lock:
+                    global_stats['last_state_save'] = current_time
                 save_processing_state(processed_files, [], recovery_file)
-                global_stats['last_state_save'] = current_time
 
             if event is None:
                 max_empty_count = (conf['RECORDING_LENGTH'] * 2 + 30)
@@ -806,22 +1441,29 @@ def main():
             
             if not file_path:
                 log.warning(f"Skipping file with invalid path: {os.path.join(path, file_name)}")
-                global_stats['skipped_count'] += 1
+                with global_stats_lock:
+                    global_stats['skipped_count'] += 1
+                if HAS_PROMETHEUS:
+                    SKIPPED_FILES.inc()
                 continue
             
-            # Prevent double processing of files
-            if file_path in processed_files:
-                log.debug(f'Skipping already processed file: {file_path}')
-                global_stats['skipped_count'] += 1
-                continue
-            
-            processed_files.add(file_path)
-            
-            # Limit the size of processed_files to prevent memory growth
-            if len(processed_files) > processed_files_limit:
-                # Keep only the most recent entries
-                processed_files = set(list(processed_files)[-processed_files_limit//2:])
-                log.info(f"Trimmed processed_files memory to {len(processed_files)} entries")
+            # Prevent double processing of files (with thread safety)
+            with processed_files_lock:
+                if file_path in processed_files:
+                    log.debug(f'Skipping already processed file: {file_path}')
+                    with global_stats_lock:
+                        global_stats['skipped_count'] += 1
+                    if HAS_PROMETHEUS:
+                        SKIPPED_FILES.inc()
+                    continue
+                
+                processed_files.add(file_path)
+                
+                # Limit the size of processed_files to prevent memory growth
+                if len(processed_files) > processed_files_limit:
+                    # Keep only the most recent entries
+                    processed_files = set(list(processed_files)[-processed_files_limit//2:])
+                    log.info(f"Trimmed processed_files memory to {len(processed_files)} entries")
             
             # Check for system overload and throttle if needed
             if is_system_overloaded(conf):
@@ -829,12 +1471,24 @@ def main():
                 log.info(f"System load high, throttling for {overload_delay} seconds")
                 time.sleep(overload_delay)
             
+            # Validate file before processing
+            if not validate_wav_file(file_path, conf=conf):
+                with global_stats_lock:
+                    global_stats['skipped_count'] += 1
+                if HAS_PROMETHEUS:
+                    SKIPPED_FILES.inc()
+                continue
+            
             # Process the file
             try:
                 process_file(file_path, report_queue, conf, base_dir)
-                global_stats['processed_count'] += 1
+                with global_stats_lock:
+                    global_stats['processed_count'] += 1
+                if HAS_PROMETHEUS:
+                    PROCESSED_FILES.inc()
             except Exception as e:
-                global_stats['error_count'] += 1
+                with global_stats_lock:
+                    global_stats['error_count'] += 1
                 error_id = log_error_with_context(e, {"context": "main_loop_processing", "file": file_path})
                 log.error(f"Error processing file (ID: {error_id}): {e}")
                 
@@ -869,6 +1523,13 @@ def main():
         except Exception as e:
             log.warning(f"Could not verify queue completion: {e}")
         
+        # Clean up database connections
+        if db_connection_pool is not None:
+            try:
+                db_connection_pool.close_all()
+            except Exception as e:
+                log.warning(f"Error closing database connections: {e}")
+        
         # Final health update
         update_health_file(health_check_file, "stopped", {
             "queue_size": 0,
@@ -883,7 +1544,9 @@ def main():
         log.info(f"BirdNet analysis completed successfully after {runtime:.1f}s")
         log.info(f"Stats: processed={global_stats['processed_count']}, "
                 f"errors={global_stats['error_count']}, "
-                f"skipped={global_stats['skipped_count']}")
+                f"skipped={global_stats['skipped_count']}, "
+                f"corrupt={global_stats.get('corrupt_files_detected', 0)}, "
+                f"timeouts={global_stats.get('timeouts', 0)}")
         
     except Exception as e:
         error_id = log_error_with_context(e, {"context": "main_execution"})
@@ -911,6 +1574,7 @@ def process_file(file_name, report_queue, conf, base_dir=None):
     context = {"file": os.path.basename(file_name)}
     file_size_warning_mb = conf.get('FILE_SIZE_WARNING_THRESHOLD_MB', 100)
     path_validation_strict = conf.get('PATH_VALIDATION_STRICT', True)
+    analysis_timeout = conf.get('ANALYSIS_TIMEOUT', 300)  # Default 5 minutes timeout
     
     try:
         # Sanitize path
@@ -958,10 +1622,41 @@ def process_file(file_name, report_queue, conf, base_dir=None):
                 log.info(f"System load high during analysis, throttling for {throttle_delay}s")
                 time.sleep(throttle_delay)
             
-            # Run the analysis
+            # Run the analysis with timeout
             analysis_start_time = time.time()
-            detections = run_analysis(file)
+            
+            try:
+                # Use ThreadPoolExecutor for timeout
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_analysis, file)
+                    try:
+                        detections = future.result(timeout=analysis_timeout)
+                    except TimeoutError:
+                        # Handle timeout
+                        log.error(f"Analysis timeout after {analysis_timeout}s for file: {file.file_name}")
+                        with global_stats_lock:
+                            global_stats['timeouts'] = global_stats.get('timeouts', 0) + 1
+                        if HAS_PROMETHEUS:
+                            TIMEOUT_COUNT.inc()
+                        raise RuntimeError(f"Analysis timed out after {analysis_timeout}s")
+            except RuntimeError as e:
+                # Re-raise timeout errors
+                raise e
+            except Exception as e:
+                # Catch and log other errors in the analysis function
+                log.error(f"Error in run_analysis: {e}")
+                raise e
+                    
             analysis_duration = time.time() - analysis_start_time
+            
+            # Track slow analyses
+            if analysis_duration > 60:  # More than 1 minute is considered slow
+                with global_stats_lock:
+                    global_stats['slow_analyses'] = global_stats.get('slow_analyses', 0) + 1
+            
+            # Update metrics
+            if HAS_PROMETHEUS:
+                ANALYSIS_DURATION.observe(analysis_duration)
             
             # Log analysis results
             detection_count = len(detections) if detections else 0
@@ -973,11 +1668,13 @@ def process_file(file_name, report_queue, conf, base_dir=None):
                 "analysis_duration": f"{analysis_duration:.2f}s"
             })
             
-            # Check if queue is full
+            # Safely add to queue with timeout to prevent deadlock
             timeout = conf['QUEUE_TIMEOUT']
             try:
                 # Add to queue with timeout to prevent deadlock
                 report_queue.put((file, detections), timeout=timeout)
+                if HAS_PROMETHEUS:
+                    QUEUE_SIZE.set(report_queue.qsize())
             except Exception as e:
                 log.error(f"Failed to add to queue (likely full): {e}")
                 # Save to temporary file for later processing
@@ -988,16 +1685,18 @@ def process_file(file_name, report_queue, conf, base_dir=None):
                         recovery_dir, 
                         f"recovery_{int(time.time())}_{os.path.basename(file_name)}.json"
                     )
-                    with open(recovery_file, 'w') as f:
-                        # Can't directly serialize detection objects, so use their string representations
-                        json.dump({
-                            "file_name": file.file_name,
-                            "timestamp": time.time(),
-                            "detection_count": len(detections)
-                        }, f)
+                    
+                    # Use atomic write for reliability
+                    atomic_write_json({
+                        "file_name": file.file_name,
+                        "timestamp": time.time(),
+                        "detection_count": len(detections)
+                    }, recovery_file)
+                    
                     log.info(f"Saved analysis results to recovery file: {recovery_file}")
                 except Exception as save_err:
-                    log.error(f"Failed to save recovery file: {save_err}")
+                    error_id = log_error_with_context(save_err, {"context": "recovery_save"})
+                    log.error(f"Failed to save recovery file (ID: {error_id}): {save_err}")
             
         finally:
             # Clean up ANALYZING_NOW file
@@ -1038,11 +1737,12 @@ def handle_reporting_queue(queue, conf):
                                    reset_timeout=conf['WEATHER_RESET_TIMEOUT'])
     
     # Add circuit breakers to global stats for monitoring
-    global_stats['circuit_breakers'] = {
-        'database': db_circuit.get_stats(),
-        'apprise': apprise_circuit.get_stats(),
-        'bird_weather': weather_circuit.get_stats()
-    }
+    with global_stats_lock:
+        global_stats['circuit_breakers'] = {
+            'database': db_circuit.get_stats(),
+            'apprise': apprise_circuit.get_stats(),
+            'bird_weather': weather_circuit.get_stats()
+        }
     
     max_retries = conf['MAX_REPORTING_RETRIES']  # Retry mechanism for robustness
     retry_delay = conf['RETRY_DELAY']  # Seconds between retries
@@ -1058,14 +1758,16 @@ def handle_reporting_queue(queue, conf):
             # Log periodic status
             current_time = time.time()
             if current_time - last_status_log > status_interval:
-                # Update circuit breaker stats in global stats
-                global_stats['circuit_breakers'] = {
-                    'database': db_circuit.get_stats(),
-                    'apprise': apprise_circuit.get_stats(),
-                    'bird_weather': weather_circuit.get_stats()
-                }
+                # Update circuit breaker stats in global stats with thread safety
+                with global_stats_lock:
+                    global_stats['circuit_breakers'] = {
+                        'database': db_circuit.get_stats(),
+                        'apprise': apprise_circuit.get_stats(),
+                        'bird_weather': weather_circuit.get_stats()
+                    }
                 
                 log.info(f"Reporting queue stats: processed={processed_count}, errors={error_count}, " +
+                         f"queue_size={queue.qsize()}, " +
                          f"db_circuit={'open' if db_circuit.open else 'closed'}, " +
                          f"apprise_circuit={'open' if apprise_circuit.open else 'closed'}, " +
                          f"weather_circuit={'open' if weather_circuit.open else 'closed'}")
@@ -1075,7 +1777,7 @@ def handle_reporting_queue(queue, conf):
             try:
                 msg = queue.get(timeout=1.0)
             except Empty:
-                if shutdown:
+                if shutdown or shutdown_event.is_set():
                     break
                 continue
                 
@@ -1096,7 +1798,10 @@ def handle_reporting_queue(queue, conf):
                     }
                     
                     # Update JSON file (always try this, it's local)
-                    update_json_file(file, detections)
+                    try:
+                        update_json_file(file, detections)
+                    except Exception as json_err:
+                        log.warning(f"Error updating JSON file: {json_err}")
                     
                     for detection in detections:
                         # Extract detection (always try this, it's local)
@@ -1117,8 +1822,17 @@ def handle_reporting_queue(queue, conf):
                         # Write to DB if circuit is closed
                         if db_circuit.can_execute():
                             try:
-                                write_to_db(file, detection)
-                                db_circuit.record_success()
+                                # Get a database connection from the pool
+                                connection = None
+                                try:
+                                    connection = db_connection_pool.get_connection()
+                                    # Call write_to_db with the connection
+                                    write_to_db(file, detection, connection)
+                                    db_circuit.record_success()
+                                finally:
+                                    # Always return the connection to the pool
+                                    if connection is not None:
+                                        db_connection_pool.release_connection(connection)
                             except Exception as db_err:
                                 db_circuit.record_failure()
                                 log.warning(f"DB write error: {db_err} - Circuit breaker active: {db_circuit.open}")
@@ -1180,9 +1894,10 @@ def handle_reporting_queue(queue, conf):
             if 'msg' in locals() and msg is not None:
                 queue.task_done()
 
-    # Update final stats
-    global_stats['reporting_processed'] = processed_count
-    global_stats['reporting_errors'] = error_count
+    # Update final stats with thread safety
+    with global_stats_lock:
+        global_stats['reporting_processed'] = processed_count
+        global_stats['reporting_errors'] = error_count
     
     log.info(f'handle_reporting_queue done - processed {processed_count} files with {error_count} errors')
 
